@@ -34,19 +34,23 @@ const MENU_STATE = {
 let currentMenuState = MENU_STATE.MAIN;
 let breadcrumbPath = ['Main Menu'];
 
-// Default configuration
+// DEFAULT_CONFIG
 const DEFAULT_CONFIG = {
   rpcUrl: 'https://api.mainnet-beta.solana.com',
   feeLevels: {
     low: 5000,
     medium: 10000,
-    high: 20000
+    high: 20000,
+    urgent: 30000,   // Tambahkan level urgent
+    custom: 0        // Nilai default untuk kustom
   },
   defaultFee: 'medium',
+  priorityFeeMultiplier: 1.0, // Faktor pengali untuk menyesuaikan dengan kondisi jaringan
+  dynamicFee: false,        // Fitur fee dinamis berdasarkan kondisi jaringan
   antiMEV: true,
-  defaultBuyAmount: 0.1, // in SOL
+  defaultBuyAmount: 0.1,    // in SOL
   defaultSellPercentage: 20, // 20%
-  slippage: 1, // 1%
+  slippage: 1,              // 1%
 };
 
 // Create readline interface
@@ -734,12 +738,20 @@ async function configureBot() {
   console.log(`4. Default buy amount: ${config.defaultBuyAmount} SOL`);
   console.log(`5. Default sell percentage: ${config.defaultSellPercentage}%`);
   console.log(`6. Slippage: ${config.slippage}%`);
+  console.log(`7. Fee settings`.yellow);
+  console.log(`   a. Low fee: ${config.feeLevels.low}`);
+  console.log(`   b. Medium fee: ${config.feeLevels.medium}`);
+  console.log(`   c. High fee: ${config.feeLevels.high}`);
+  console.log(`   d. Urgent fee: ${config.feeLevels.urgent || 30000}`);
+  console.log(`   e. Custom fee: ${config.feeLevels.custom || 0}`);
+  console.log(`   f. Dynamic fee: ${config.dynamicFee ? 'ON' : 'OFF'}`);
+  console.log(`   g. Priority fee multiplier: ${config.priorityFeeMultiplier || 1.0}x`);
   console.log('');
-  console.log('7. Save and return to main menu'.green);
+  console.log('8. Save and return to main menu'.green);
   console.log('0. Cancel and return to main menu'.gray);
   console.log('');
   
-  rl.question('Select a setting to change (0-7): ', async (choice) => {
+  rl.question('Select a setting to change (0-8 or 7a-7g): ', async (choice) => {
     switch (choice) {
       case '0':
         goBack();
@@ -794,7 +806,74 @@ async function configureBot() {
           navigateTo(MENU_STATE.CONFIG, 'Configuration');
         });
         break;
-      case '7':
+      case '7a':
+        rl.question('Enter new Low fee (recommended: 3000-5000): ', (fee) => {
+          const feeValue = parseInt(fee);
+          if (!isNaN(feeValue) && feeValue > 0) {
+            config.feeLevels.low = feeValue;
+          }
+          fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
+          navigateTo(MENU_STATE.CONFIG, 'Configuration');
+        });
+        break;
+      case '7b':
+        rl.question('Enter new Medium fee (recommended: 8000-12000): ', (fee) => {
+          const feeValue = parseInt(fee);
+          if (!isNaN(feeValue) && feeValue > 0) {
+            config.feeLevels.medium = feeValue;
+          }
+          fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
+          navigateTo(MENU_STATE.CONFIG, 'Configuration');
+        });
+        break;
+      case '7c':
+        rl.question('Enter new High fee (recommended: 15000-25000): ', (fee) => {
+          const feeValue = parseInt(fee);
+          if (!isNaN(feeValue) && feeValue > 0) {
+            config.feeLevels.high = feeValue;
+          }
+          fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
+          navigateTo(MENU_STATE.CONFIG, 'Configuration');
+        });
+        break;
+      case '7d':
+        rl.question('Enter new Urgent fee (recommended: 30000-50000): ', (fee) => {
+          const feeValue = parseInt(fee);
+          if (!isNaN(feeValue) && feeValue > 0) {
+            config.feeLevels.urgent = feeValue;
+          }
+          fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
+          navigateTo(MENU_STATE.CONFIG, 'Configuration');
+        });
+        break;
+      case '7e':
+        rl.question('Enter custom fee value: ', (fee) => {
+          const feeValue = parseInt(fee);
+          if (!isNaN(feeValue) && feeValue >= 0) {
+            config.feeLevels.custom = feeValue;
+          }
+          fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
+          navigateTo(MENU_STATE.CONFIG, 'Configuration');
+        });
+        break;
+      case '7f':
+        rl.question('Enable dynamic fee (on/off): ', (dynamicFee) => {
+          config.dynamicFee = dynamicFee.toLowerCase() === 'on';
+          fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
+          navigateTo(MENU_STATE.CONFIG, 'Configuration');
+        });
+        break;
+      case '7g':
+        rl.question('Enter priority fee multiplier (0.5-5.0): ', (multiplier) => {
+          const value = parseFloat(multiplier);
+          if (!isNaN(value) && value > 0) {
+            config.priorityFeeMultiplier = value;
+          }
+          fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
+          navigateTo(MENU_STATE.CONFIG, 'Configuration');
+        });
+        break;
+      case '8':
         fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
         console.log('Configuration saved!'.green);
         
@@ -952,8 +1031,43 @@ async function buyToken(tokenAddress, options = {}) {
     // Initialize Jupiter API client
     const jupiterQuoteApi = createJupiterApiClient();
     
-    // Calculate fee level
-    const computeLimit = config.feeLevels[config.defaultFee];
+    // Calculate fee level - tambahan untuk fee kustom dan dinamis
+    let computeLimit;
+    const selectedFeeType = options.feeType || config.defaultFee;
+    
+    if (selectedFeeType === 'custom' && config.feeLevels.custom > 0) {
+      computeLimit = config.feeLevels.custom;
+    } else if (config.dynamicFee) {
+      // Gunakan fee dinamis berdasarkan kondisi jaringan
+      try {
+        // Cek kondisi jaringan - sebagai contoh sederhana ambil recent priority fees
+        const baseFee = config.feeLevels[selectedFeeType];
+        
+        // Coba dapatkan recent prioritization fees untuk estimasi yang lebih baik
+        try {
+          // Gunakan getRecentPrioritizationFees API jika tersedia
+          const recentPrioritizationFeesResponse = await connection.getRecentPrioritizationFees();
+          if (recentPrioritizationFeesResponse && recentPrioritizationFeesResponse.length > 0) {
+            // Ambil rata-rata dari 5 prioritization fee terakhir
+            const recentFees = recentPrioritizationFeesResponse.slice(0, 5);
+            const avgPriorityMultiplier = recentFees.reduce((acc, fee) => acc + fee.prioritizationFee, 0) / recentFees.length;
+            // Terapkan multiplier dengan batas minimum 1.0
+            const dynamicMultiplier = Math.max(1.0, avgPriorityMultiplier / 5000); // Normalisasi
+            computeLimit = Math.floor(baseFee * Math.min(dynamicMultiplier, config.priorityFeeMultiplier));
+          } else {
+            computeLimit = Math.floor(baseFee * config.priorityFeeMultiplier);
+          }
+        } catch (error) {
+          // Jika gagal mendapatkan recent prioritization fees, gunakan multiplier dari config
+          computeLimit = Math.floor(baseFee * config.priorityFeeMultiplier);
+        }
+      } catch (error) {
+        // Fallback ke nilai default jika gagal mendapatkan kondisi jaringan
+        computeLimit = config.feeLevels[selectedFeeType];
+      }
+    } else {
+      computeLimit = config.feeLevels[selectedFeeType];
+    }
     
     // Get quotes
     const quoteResponse = await jupiterQuoteApi.quoteGet({
@@ -986,18 +1100,41 @@ async function buyToken(tokenAddress, options = {}) {
     const swapTransactionBuf = Buffer.from(swapResponse.data.swapTransaction, 'base64');
     const transaction = Transaction.from(swapTransactionBuf);
     
-    // Add compute budget instruction if needed
+    // Tambahkan ComputeBudgetProgram untuk transaksi dengan fee yang disesuaikan
     if (computeLimit) {
-      // Add compute budget instruction
-      // Note: Jupiter API v6 already includes this in most cases
+      // Import ComputeBudgetProgram
+      const { ComputeBudgetProgram } = require('@solana/web3.js');
+      
+      // Tambahkan instruksi ComputeBudget untuk menetapkan limit unit compute
+      const computeBudgetIx = ComputeBudgetProgram.setComputeUnitLimit({
+        units: computeLimit
+      });
+      
+      // Tambahkan priorityFee jika menggunakan priorityFeeMultiplier > 1
+      if (config.priorityFeeMultiplier > 1) {
+        // Hitung microLamports berdasarkan nilai computeLimit
+        const priorityFeeMicroLamports = Math.floor((computeLimit / 10) * config.priorityFeeMultiplier);
+        const priorityFeeIx = ComputeBudgetProgram.setComputeUnitPrice({
+          microLamports: priorityFeeMicroLamports
+        });
+        
+        // Tambahkan instruksi ke awal transaksi
+        transaction.instructions.unshift(priorityFeeIx);
+        spinner.text = `Processing with priority fee: ${priorityFeeMicroLamports} microLamports...`;
+      }
+      
+      // Tambahkan instruksi compute limit ke awal transaksi
+      transaction.instructions.unshift(computeBudgetIx);
     }
     
     // Set transaction options
     const options = config.antiMEV ? {
       skipPreflight: true,
       preflightCommitment: 'processed',
+      maxRetries: 3  // Tambahkan maxRetries untuk mencoba kembali jika gagal
     } : {
-      preflightCommitment: 'confirmed'
+      preflightCommitment: 'confirmed',
+      maxRetries: 3
     };
     
     // Send and confirm transaction
@@ -1017,7 +1154,9 @@ async function buyToken(tokenAddress, options = {}) {
       buyPrice: parseFloat(bestRoute.outAmount) / parseFloat(bestRoute.inAmount),
       amount: parseFloat(bestRoute.outAmount),
       buyTime: Date.now(),
-      buyAmountSol: amount
+      buyAmountSol: amount,
+      computeUnits: computeLimit, // Tambahkan informasi compute units yang digunakan
+      priorityFee: config.priorityFeeMultiplier > 1 ? `${Math.floor((computeLimit / 10) * config.priorityFeeMultiplier)} microLamports` : 'None'
     };
     
     // Add to holdings
@@ -1030,7 +1169,9 @@ async function buyToken(tokenAddress, options = {}) {
       amount: amount,
       price: tokenInfo.buyPrice,
       time: Date.now(),
-      txid: result
+      txid: result,
+      computeUnits: computeLimit,
+      priorityFee: config.priorityFeeMultiplier > 1 ? `${Math.floor((computeLimit / 10) * config.priorityFeeMultiplier)} microLamports` : 'None'
     });
     
     // Save holdings
@@ -1038,6 +1179,11 @@ async function buyToken(tokenAddress, options = {}) {
     
     spinner.succeed(`Successfully bought ${tokenInfo.amount} tokens for ${amount} SOL!`);
     console.log(`Transaction ID: ${result}`);
+    
+    if (config.priorityFeeMultiplier > 1) {
+      console.log(`Priority Fee: ${Math.floor((computeLimit / 10) * config.priorityFeeMultiplier)} microLamports`);
+    }
+    console.log(`Compute Units: ${computeLimit}`);
     
   } catch (error) {
     spinner.fail(`Error buying token: ${error.message}`);
@@ -1081,8 +1227,47 @@ async function sellToken(tokenAddress, options = {}) {
     // Initialize Jupiter API client
     const jupiterQuoteApi = createJupiterApiClient();
     
-    // Calculate fee level
-    const computeLimit = config.feeLevels[config.defaultFee];
+    // Calculate fee level - tambahan untuk fee kustom dan dinamis
+    let computeLimit;
+    const selectedFeeType = options.feeType || config.defaultFee;
+    
+    // Jika menjual semua (100%) atau persentase tinggi (> 50%), gunakan fee yang lebih tinggi 
+    // untuk memastikan transaksi berhasil
+    if (sellPercentage >= 50 && selectedFeeType === 'medium') {
+      // Upgrade ke high fee untuk transaksi penting
+      selectedFeeType = 'high';
+    }
+    
+    if (selectedFeeType === 'custom' && config.feeLevels.custom > 0) {
+      computeLimit = config.feeLevels.custom;
+    } else if (config.dynamicFee) {
+      // Gunakan fee dinamis berdasarkan kondisi jaringan
+      try {
+        // Cek kondisi jaringan dengan recent priority fees
+        const baseFee = config.feeLevels[selectedFeeType];
+        
+        // Coba dapatkan recent prioritization fees untuk estimasi yang lebih baik
+        try {
+          const recentPrioritizationFeesResponse = await connection.getRecentPrioritizationFees();
+          if (recentPrioritizationFeesResponse && recentPrioritizationFeesResponse.length > 0) {
+            const recentFees = recentPrioritizationFeesResponse.slice(0, 5);
+            const avgPriorityMultiplier = recentFees.reduce((acc, fee) => acc + fee.prioritizationFee, 0) / recentFees.length;
+            const dynamicMultiplier = Math.max(1.0, avgPriorityMultiplier / 5000);
+            // Untuk SELL, kita bisa menggunakan multiplier yang sedikit lebih tinggi untuk memastikan eksekusi cepat
+            const sellMultiplierBoost = sellPercentage >= 75 ? 1.5 : 1.2; // Boost tambahan untuk sell besar
+            computeLimit = Math.floor(baseFee * Math.min(dynamicMultiplier * sellMultiplierBoost, config.priorityFeeMultiplier * 1.5));
+          } else {
+            computeLimit = Math.floor(baseFee * config.priorityFeeMultiplier);
+          }
+        } catch (error) {
+          computeLimit = Math.floor(baseFee * config.priorityFeeMultiplier);
+        }
+      } catch (error) {
+        computeLimit = config.feeLevels[selectedFeeType];
+      }
+    } else {
+      computeLimit = config.feeLevels[selectedFeeType];
+    }
     
     // Get quotes
     const quoteResponse = await jupiterQuoteApi.quoteGet({
@@ -1115,18 +1300,43 @@ async function sellToken(tokenAddress, options = {}) {
     const swapTransactionBuf = Buffer.from(swapResponse.data.swapTransaction, 'base64');
     const transaction = Transaction.from(swapTransactionBuf);
     
-    // Add compute budget instruction if needed
+    // Tambahkan ComputeBudgetProgram untuk transaksi dengan fee yang disesuaikan
     if (computeLimit) {
-      // Add compute budget instruction
-      // Note: Jupiter API v6 already includes this in most cases
+      // Import ComputeBudgetProgram
+      const { ComputeBudgetProgram } = require('@solana/web3.js');
+      
+      // Tambahkan instruksi ComputeBudget untuk menetapkan limit unit compute
+      const computeBudgetIx = ComputeBudgetProgram.setComputeUnitLimit({
+        units: computeLimit
+      });
+      
+      // Tambahkan priorityFee jika menggunakan priorityFeeMultiplier > 1
+      if (config.priorityFeeMultiplier > 1) {
+        // Untuk SELL, kita gunakan multiplier yang lebih tinggi agar transaksi lebih cepat tereksekusi
+        const sellMultiplierBoost = sellPercentage >= 75 ? 1.5 : 1.2;
+        const priorityFeeMicroLamports = Math.floor((computeLimit / 10) * config.priorityFeeMultiplier * sellMultiplierBoost);
+        
+        const priorityFeeIx = ComputeBudgetProgram.setComputeUnitPrice({
+          microLamports: priorityFeeMicroLamports
+        });
+        
+        // Tambahkan instruksi ke awal transaksi
+        transaction.instructions.unshift(priorityFeeIx);
+        spinner.text = `Processing with priority fee: ${priorityFeeMicroLamports} microLamports...`;
+      }
+      
+      // Tambahkan instruksi compute limit ke awal transaksi
+      transaction.instructions.unshift(computeBudgetIx);
     }
     
     // Set transaction options
     const options = config.antiMEV ? {
       skipPreflight: true,
       preflightCommitment: 'processed',
+      maxRetries: 3  // Tambahkan maxRetries untuk mencoba kembali jika gagal
     } : {
-      preflightCommitment: 'confirmed'
+      preflightCommitment: 'confirmed',
+      maxRetries: 3
     };
     
     // Send and confirm transaction
@@ -1149,6 +1359,10 @@ async function sellToken(tokenAddress, options = {}) {
       tokenInfo.amount -= sellAmount;
     }
     
+    // Hitung priorityFee yang digunakan
+    const priorityFeeMicroLamports = config.priorityFeeMultiplier > 1 ? 
+      Math.floor((computeLimit / 10) * config.priorityFeeMultiplier * (sellPercentage >= 75 ? 1.5 : 1.2)) : 0;
+    
     // Add to transactions
     holdings.transactions.push({
       type: 'sell',
@@ -1159,7 +1373,9 @@ async function sellToken(tokenAddress, options = {}) {
       profit: profit,
       profitPercentage: profitPercentage,
       time: Date.now(),
-      txid: result
+      txid: result,
+      computeUnits: computeLimit,
+      priorityFee: priorityFeeMicroLamports > 0 ? `${priorityFeeMicroLamports} microLamports` : 'None'
     });
     
     // Save holdings
@@ -1168,6 +1384,11 @@ async function sellToken(tokenAddress, options = {}) {
     spinner.succeed(`Successfully sold ${sellPercentage}% of ${tokenAddress.slice(0, 8)}... for ${soldAmountSol.toFixed(4)} SOL!`);
     console.log(`Profit: ${profit.toFixed(4)} SOL (${profitPercentage.toFixed(2)}%)`);
     console.log(`Transaction ID: ${result}`);
+    
+    if (priorityFeeMicroLamports > 0) {
+      console.log(`Priority Fee: ${priorityFeeMicroLamports} microLamports`);
+    }
+    console.log(`Compute Units: ${computeLimit}`);
     
   } catch (error) {
     spinner.fail(`Error selling token: ${error.message}`);
