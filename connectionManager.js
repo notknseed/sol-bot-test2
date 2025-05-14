@@ -1,9 +1,13 @@
-// connectionManager.js
+// connectionManager.js - Fixed version
 const { Connection } = require('@solana/web3.js');
 const fs = require('fs');
 
-// Singleton instance
-let connectionInstance = null;
+// Multiple connection instances based on commitment
+const connectionInstances = {
+  processed: null,
+  confirmed: null,
+  finalized: null
+};
 
 // Load config
 function loadConfig(configPath = 'config.json') {
@@ -24,8 +28,13 @@ function loadConfig(configPath = 'config.json') {
  * @returns {Connection} Solana connection instance
  */
 function getConnection(forceRefresh = false, configPath = 'config.json', commitment = 'confirmed') {
-  if (connectionInstance && !forceRefresh) {
-    return connectionInstance;
+  if (!['processed', 'confirmed', 'finalized'].includes(commitment)) {
+    commitment = 'confirmed'; // Default to confirmed if invalid commitment provided
+  }
+  
+  // Return cached instance if available and not forcing refresh
+  if (connectionInstances[commitment] && !forceRefresh) {
+    return connectionInstances[commitment];
   }
 
   // Load config to get RPC URL
@@ -33,20 +42,27 @@ function getConnection(forceRefresh = false, configPath = 'config.json', commitm
   const rpcUrl = config.rpcUrl || "https://api.mainnet-beta.solana.com";
   
   // Create new connection with specified commitment
-  connectionInstance = new Connection(rpcUrl, commitment);
+  // Add additional options to improve reliability
+  connectionInstances[commitment] = new Connection(rpcUrl, {
+    commitment: commitment,
+    confirmTransactionInitialTimeout: 60000, // 60 seconds
+    disableRetryOnRateLimit: false,
+    httpHeaders: { 'User-Agent': 'solana-meme-trader/1.0.0' }
+  });
   
-  return connectionInstance;
+  return connectionInstances[commitment];
 }
 
 /**
  * Test the connection to ensure it's working
  * @param {boolean} verbose Whether to log detailed information
+ * @param {string} commitment Commitment level to test
  * @returns {Promise<boolean>} Whether the connection is working
  */
-async function testConnection(verbose = false) {
+async function testConnection(verbose = false, commitment = 'confirmed') {
   try {
-    const connection = getConnection();
-    if (verbose) console.log('Checking RPC connection...');
+    const connection = getConnection(false, 'config.json', commitment);
+    if (verbose) console.log(`Checking RPC connection with ${commitment} commitment...`);
     
     const blockchainInfo = await connection.getVersion();
     
@@ -59,6 +75,16 @@ async function testConnection(verbose = false) {
 }
 
 /**
+ * Reset all connection instances - useful for when switching RPC providers
+ */
+function resetConnections() {
+  connectionInstances.processed = null;
+  connectionInstances.confirmed = null;
+  connectionInstances.finalized = null;
+  console.log('All connection instances have been reset');
+}
+
+/**
  * Helper function to verify transaction on-chain
  * @param {string} signature Transaction signature to verify
  * @param {number} maxRetries Maximum number of retries
@@ -68,7 +94,8 @@ async function testConnection(verbose = false) {
 async function verifyTransactionOnChain(signature, maxRetries = 40, verbose = false) {
   if (verbose) console.log(`Verifying transaction ${signature} on chain...`);
   
-  const connection = getConnection();
+  // Use finalized commitment for verification
+  const connection = getConnection(false, 'config.json', 'finalized');
   
   // First, wait for the transaction to be finalized
   let retries = maxRetries;
@@ -77,7 +104,7 @@ async function verifyTransactionOnChain(signature, maxRetries = 40, verbose = fa
   
   while (retries > 0) {
     try {
-      const signatureStatuses = await connection.getSignatureStatuses([signature]);
+      const signatureStatuses = await connection.getSignatureStatuses([signature], {searchTransactionHistory: true});
       status = signatureStatuses && signatureStatuses.value[0];
       
       if (status) {
@@ -109,11 +136,15 @@ async function verifyTransactionOnChain(signature, maxRetries = 40, verbose = fa
   if (!txSuccess) {
     // Double-check by trying to get the transaction directly
     try {
-      const tx = await connection.getTransaction(signature, { maxSupportedTransactionVersion: 0 });
-      if (tx && !tx.meta.err) {
+      const tx = await connection.getTransaction(signature, { 
+        maxSupportedTransactionVersion: 0,
+        commitment: 'finalized'
+      });
+      
+      if (tx && !tx.meta?.err) {
         if (verbose) console.log(`Transaction ${signature} found on chain through direct lookup`);
         txSuccess = true;
-      } else if (tx && tx.meta.err) {
+      } else if (tx && tx.meta?.err) {
         if (verbose) console.log(`Transaction ${signature} found on chain but has errors:`, tx.meta.err);
         return { 
           success: false, 
@@ -129,7 +160,10 @@ async function verifyTransactionOnChain(signature, maxRetries = 40, verbose = fa
   // Now verify the token transfer by checking the post balances
   if (txSuccess) {
     try {
-      const tx = await connection.getTransaction(signature, { maxSupportedTransactionVersion: 0 });
+      const tx = await connection.getTransaction(signature, { 
+        maxSupportedTransactionVersion: 0,
+        commitment: 'finalized'
+      });
       
       if (!tx) {
         return { 
@@ -147,31 +181,6 @@ async function verifyTransactionOnChain(signature, maxRetries = 40, verbose = fa
           error: tx.meta.err, 
           status: 'failed' 
         };
-      }
-      
-      // Verify that the transaction is actually finalized
-      // This is a final security check to avoid false positives
-      if (tx.confirmationStatus !== 'finalized') {
-        const retriesForFinalization = 10;
-        let finalized = false;
-        
-        for (let i = 0; i < retriesForFinalization; i++) {
-          const currentStatus = await connection.getSignatureStatus(signature);
-          if (currentStatus && currentStatus.value && currentStatus.value.confirmationStatus === 'finalized') {
-            finalized = true;
-            break;
-          }
-          await new Promise(resolve => setTimeout(resolve, 1000));
-        }
-        
-        if (!finalized) {
-          if (verbose) console.log(`Transaction exists but is not finalized after additional checks`);
-          return { 
-            success: false, 
-            error: 'Transaction not finalized', 
-            status: 'not_finalized' 
-          };
-        }
       }
       
       // At this point, we're confident the transaction succeeded and is finalized
@@ -200,5 +209,6 @@ async function verifyTransactionOnChain(signature, maxRetries = 40, verbose = fa
 module.exports = {
   getConnection,
   testConnection,
+  resetConnections,
   verifyTransactionOnChain
 };
