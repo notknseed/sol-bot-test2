@@ -17,9 +17,8 @@ async function main() {
     .command('create-wallet')
     .description('Create a new wallet')
     .option('-p, --path <path>', 'Wallet file path', 'wallet.json')
-    .option('--no-password', 'Skip password encryption (not recommended)')
     .action(async (options) => {
-      await createWallet(options.path, options.password);
+      await createWallet(options.path, true);
     });
 
   program
@@ -27,9 +26,8 @@ async function main() {
     .description('Import a wallet from private key')
     .argument('<privateKey>', 'Private key to import (base58 encoded or array format)')
     .option('-p, --path <path>', 'Wallet file path', 'wallet.json')
-    .option('--no-password', 'Skip password encryption (not recommended)')
     .action(async (privateKey, options) => {
-      await importWallet(privateKey, options.path, options.password);
+      await importWallet(privateKey, options.path, true);
     });
 
   // Buy command
