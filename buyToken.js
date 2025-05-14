@@ -1,10 +1,11 @@
 // updatedBuyToken.js
-const { Connection, PublicKey, Keypair, Transaction, VersionedTransaction, sendAndConfirmTransaction, LAMPORTS_PER_SOL } = require('@solana/web3.js');
+const { PublicKey, Keypair, Transaction, VersionedTransaction, sendAndConfirmTransaction, LAMPORTS_PER_SOL } = require('@solana/web3.js');
 const { ComputeBudgetProgram } = require('@solana/web3.js');
 const { createJupiterApiClient } = require('@jup-ag/api');
 const ora = require('ora');
 const fs = require('fs');
 const path = require('path');
+const { getConnection } = require('./connectionManager');
 
 // Load config
 function loadConfig(configPath = 'config.json') {
@@ -18,8 +19,10 @@ function loadConfig(configPath = 'config.json') {
 }
 
 // Helper function to verify transaction on-chain
-async function verifyTransactionOnChain(connection, signature, maxRetries = 40, verbose = false) {
+async function verifyTransactionOnChain(signature, maxRetries = 40, verbose = false) {
   if (verbose) console.log(`Verifying transaction ${signature} on chain...`);
+  
+  const connection = getConnection();
   
   // First, wait for the transaction to be finalized
   let retries = maxRetries;
@@ -173,9 +176,9 @@ async function buyToken(keypair, tokenAddress, options = {}) {
     const amount = options.amount ? parseFloat(options.amount) : config.defaultBuyAmount;
     if (verbose) console.log('Buy amount (SOL):', amount);
     
-    // Connect to Solana
-    const connection = new Connection(config.rpcUrl, 'confirmed');
-    if (verbose) console.log('RPC URL:', config.rpcUrl);
+    // Get reusable connection instance
+    const connection = getConnection();
+    if (verbose) console.log('Using reusable connection');
     
     // Test RPC connection
     try {
@@ -404,7 +407,7 @@ async function buyToken(keypair, tokenAddress, options = {}) {
         // Wait for confirmation using our safer verification method
         spinner.text = 'Waiting for transaction confirmation...';
         
-        const verificationResult = await verifyTransactionOnChain(connection, txid, 40, verbose);
+        const verificationResult = await verifyTransactionOnChain(txid, 40, verbose);
         
         if (verificationResult.success) {
           spinner.succeed(`Successfully bought tokens! Transaction finalized on chain.`);
@@ -493,7 +496,7 @@ async function buyToken(keypair, tokenAddress, options = {}) {
           // Verify that the transaction is on chain and finalized
           spinner.text = 'Verifying transaction on chain...';
           
-          const verificationResult = await verifyTransactionOnChain(connection, txid, 40, verbose);
+          const verificationResult = await verifyTransactionOnChain(txid, 40, verbose);
           
           if (verificationResult.success) {
             spinner.succeed(`Successfully bought tokens! Transaction finalized on chain.`);
