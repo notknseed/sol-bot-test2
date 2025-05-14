@@ -1,11 +1,11 @@
-// sellToken.js
-const { Connection, PublicKey, Transaction, VersionedTransaction, sendAndConfirmTransaction, LAMPORTS_PER_SOL } = require('@solana/web3.js');
+// updatedSellToken.js
+const { PublicKey, Transaction, VersionedTransaction, sendAndConfirmTransaction, LAMPORTS_PER_SOL } = require('@solana/web3.js');
 const { ComputeBudgetProgram } = require('@solana/web3.js');
 const { createJupiterApiClient } = require('@jup-ag/api');
 const ora = require('ora');
 const fs = require('fs');
 const path = require('path');
-const { verifyTransactionOnChain } = require('./buyToken');
+const { getConnection } = require('./connectionManager');
 
 // Load config
 function loadConfig(configPath = 'config.json') {
@@ -17,6 +17,8 @@ function loadConfig(configPath = 'config.json') {
     process.exit(1);
   }
 }
+
+// Helper function to verify transaction on-chain moved to connectionManager
 
 // Sell token function
 async function sellToken(keypair, tokenAddress, options = {}) {
@@ -42,9 +44,9 @@ async function sellToken(keypair, tokenAddress, options = {}) {
     let sellPercentage = options.percentage ? parseFloat(options.percentage) : 100;
     if (options.all) sellPercentage = 100;
     
-    // Need to get current token balance
-    const connection = new Connection(config.rpcUrl, 'confirmed');
-    if (verbose) console.log('RPC URL:', config.rpcUrl);
+    // Get reusable connection instance
+    const connection = getConnection();
+    if (verbose) console.log('Using reusable connection');
     
     try {
       if (verbose) console.log('Checking RPC connection...');
@@ -317,7 +319,9 @@ async function sellToken(keypair, tokenAddress, options = {}) {
         // Wait for confirmation using our verification method
         spinner.text = 'Waiting for transaction confirmation...';
         
-        const verificationResult = await verifyTransactionOnChain(connection, txid, 40, verbose);
+        // Get verifyTransactionOnChain from connection manager
+        const { verifyTransactionOnChain } = require('./connectionManager');
+        const verificationResult = await verifyTransactionOnChain(txid, 40, verbose);
         
         if (verificationResult.success) {
           // Calculate sold amount in SOL 
@@ -406,7 +410,8 @@ async function sellToken(keypair, tokenAddress, options = {}) {
           // Verify that the transaction is on chain and finalized
           spinner.text = 'Verifying transaction on chain...';
           
-          const verificationResult = await verifyTransactionOnChain(connection, txid, 40, verbose);
+          const { verifyTransactionOnChain } = require('./connectionManager');
+          const verificationResult = await verifyTransactionOnChain(txid, 40, verbose);
           
           // Calculate priorityFee used
           const priorityFeeMicroLamports = config.priorityFeeMultiplier > 1 ? 
