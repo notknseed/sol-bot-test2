@@ -1,61 +1,155 @@
-// buyToken.js
-const { Connection, PublicKey, Keypair, Transaction, sendAndConfirmTransaction, LAMPORTS_PER_SOL } = require('@solana/web3.js');
+// updatedBuyToken.js
+const { Connection, PublicKey, Keypair, Transaction, VersionedTransaction, sendAndConfirmTransaction, LAMPORTS_PER_SOL } = require('@solana/web3.js');
 const { ComputeBudgetProgram } = require('@solana/web3.js');
 const { createJupiterApiClient } = require('@jup-ag/api');
 const ora = require('ora');
 const fs = require('fs');
+const path = require('path');
 
-// Helper function to load config
-function loadConfig(CONFIG_FILE) {
-  if (fs.existsSync(CONFIG_FILE)) {
-    return JSON.parse(fs.readFileSync(CONFIG_FILE));
+// Load config
+function loadConfig(configPath = 'config.json') {
+  try {
+    const configData = fs.readFileSync(configPath, 'utf8');
+    return JSON.parse(configData);
+  } catch (error) {
+    console.error(`Error loading config from ${configPath}:`, error.message);
+    process.exit(1);
   }
-  // Return default config (should import from main app)
-  return {
-    rpcUrl: 'https://api.mainnet-beta.solana.com',
-    feeLevels: {
-      low: 5000,
-      medium: 10000,
-      high: 20000,
-      urgent: 30000,
-      custom: 0
-    },
-    defaultFee: 'medium',
-    priorityFeeMultiplier: 1.0,
-    dynamicFee: false,
-    antiMEV: true,
-    defaultBuyAmount: 0.1,
-    defaultSellPercentage: 20,
-    slippage: 1,
+}
+
+// Helper function to verify transaction on-chain
+async function verifyTransactionOnChain(connection, signature, maxRetries = 40, verbose = false) {
+  if (verbose) console.log(`Verifying transaction ${signature} on chain...`);
+  
+  // First, wait for the transaction to be finalized
+  let retries = maxRetries;
+  let txSuccess = false;
+  let status = null;
+  
+  while (retries > 0) {
+    try {
+      const signatureStatuses = await connection.getSignatureStatuses([signature]);
+      status = signatureStatuses && signatureStatuses.value[0];
+      
+      if (status) {
+        if (status.err) {
+          if (verbose) console.log(`Transaction ${signature} failed with error:`, status.err);
+          return { 
+            success: false, 
+            error: status.err, 
+            status: 'failed' 
+          };
+        } else if (status.confirmationStatus === 'finalized') {
+          if (verbose) console.log(`Transaction ${signature} finalized on chain`);
+          txSuccess = true;
+          break;
+        } else if (status.confirmationStatus === 'confirmed') {
+          if (verbose) console.log(`Transaction ${signature} confirmed but waiting for finalization...`);
+        }
+      } else {
+        if (verbose && retries % 5 === 0) console.log(`Transaction not found yet. Retries left: ${retries}`);
+      }
+    } catch (e) {
+      if (verbose) console.log(`Error checking status: ${e.message}. Retrying...`);
+    }
+    
+    retries--;
+    await new Promise(resolve => setTimeout(resolve, 1000)); // Wait 1 second between retries
+  }
+  
+  if (!txSuccess) {
+    // Double-check by trying to get the transaction directly
+    try {
+      const tx = await connection.getTransaction(signature, { maxSupportedTransactionVersion: 0 });
+      if (tx && !tx.meta.err) {
+        if (verbose) console.log(`Transaction ${signature} found on chain through direct lookup`);
+        txSuccess = true;
+      } else if (tx && tx.meta.err) {
+        if (verbose) console.log(`Transaction ${signature} found on chain but has errors:`, tx.meta.err);
+        return { 
+          success: false, 
+          error: tx.meta.err, 
+          status: 'failed' 
+        };
+      }
+    } catch (e) {
+      if (verbose) console.log(`Error getting transaction: ${e.message}`);
+    }
+  }
+
+  // Now verify the token transfer by checking the post balances
+  if (txSuccess) {
+    try {
+      const tx = await connection.getTransaction(signature, { maxSupportedTransactionVersion: 0 });
+      
+      if (!tx) {
+        return { 
+          success: false, 
+          error: 'Transaction found but details could not be retrieved', 
+          status: 'verification_failed' 
+        };
+      }
+
+      // Check for errors in transaction metadata
+      if (tx.meta && tx.meta.err) {
+        if (verbose) console.log(`Transaction has errors in metadata:`, tx.meta.err);
+        return { 
+          success: false, 
+          error: tx.meta.err, 
+          status: 'failed' 
+        };
+      }
+      
+      // Verify that the transaction is actually finalized
+      // This is a final security check to avoid false positives
+      if (tx.confirmationStatus !== 'finalized') {
+        const retriesForFinalization = 10;
+        let finalized = false;
+        
+        for (let i = 0; i < retriesForFinalization; i++) {
+          const currentStatus = await connection.getSignatureStatus(signature);
+          if (currentStatus && currentStatus.value && currentStatus.value.confirmationStatus === 'finalized') {
+            finalized = true;
+            break;
+          }
+          await new Promise(resolve => setTimeout(resolve, 1000));
+        }
+        
+        if (!finalized) {
+          if (verbose) console.log(`Transaction exists but is not finalized after additional checks`);
+          return { 
+            success: false, 
+            error: 'Transaction not finalized', 
+            status: 'not_finalized' 
+          };
+        }
+      }
+      
+      // At this point, we're confident the transaction succeeded and is finalized
+      return { 
+        success: true, 
+        status: 'finalized',
+        transaction: tx
+      };
+    } catch (error) {
+      if (verbose) console.error(`Error during transaction verification:`, error);
+      return { 
+        success: false, 
+        error: `Verification error: ${error.message}`, 
+        status: 'verification_error' 
+      };
+    }
+  }
+  
+  return { 
+    success: false, 
+    error: 'Transaction not found on chain after maximum retries', 
+    status: 'not_found' 
   };
 }
 
-// Helper function to load keypair
-function loadKeypair(KEYPAIR_FILE) {
-  const keypairData = JSON.parse(fs.readFileSync(KEYPAIR_FILE));
-  return Keypair.fromSecretKey(new Uint8Array(keypairData.secretKey));
-}
-
-// Helper function to load holdings
-function loadHoldings(HOLDINGS_FILE) {
-  if (fs.existsSync(HOLDINGS_FILE)) {
-    return JSON.parse(fs.readFileSync(HOLDINGS_FILE));
-  }
-  return { tokens: {}, transactions: [] };
-}
-
-// Helper function to save holdings
-function saveHoldings(holdings, HOLDINGS_FILE) {
-  fs.writeFileSync(HOLDINGS_FILE, JSON.stringify(holdings, null, 2));
-}
-
 // Buy token function
-async function buyToken(tokenAddress, options = {}, pathConfig = {}) {
-  // Configuration paths
-  const CONFIG_FILE = pathConfig.CONFIG_FILE || 'config.json';
-  const KEYPAIR_FILE = pathConfig.KEYPAIR_FILE || 'keypair.json';
-  const HOLDINGS_FILE = pathConfig.HOLDINGS_FILE || 'holdings.json';
-  
+async function buyToken(keypair, tokenAddress, options = {}) {
   // Verbose logging flag
   const verbose = options.verbose || false;
   
@@ -72,9 +166,8 @@ async function buyToken(tokenAddress, options = {}, pathConfig = {}) {
     const tokenPublicKey = new PublicKey(tokenAddress);
     if (verbose) console.log('Token address valid:', tokenPublicKey.toString());
     
-    // Load config and keypair
-    const config = loadConfig(CONFIG_FILE);
-    const keypair = loadKeypair(KEYPAIR_FILE);
+    // Load config
+    const config = loadConfig();
     
     // Calculate amount
     const amount = options.amount ? parseFloat(options.amount) : config.defaultBuyAmount;
@@ -161,7 +254,7 @@ async function buyToken(tokenAddress, options = {}, pathConfig = {}) {
       
       if (verbose) {
         console.log('Quote response received:', quoteResponse ? 'yes' : 'no');
-        console.log('Quote response details:', JSON.stringify(quoteResponse, null, 2));
+        if (quoteResponse) console.log('Quote response details:', JSON.stringify(quoteResponse, null, 2));
       }
       
       if (!quoteResponse) {
@@ -169,76 +262,74 @@ async function buyToken(tokenAddress, options = {}, pathConfig = {}) {
         return { success: false, error: 'No quote response' };
       }
       
-      // Jupiter API v6 has a different response structure
-      // The response is directly an object with routePlan, not quoteResponse.data
-      const routePlanData = quoteResponse.routePlan || (quoteResponse.data && quoteResponse.data.routePlan) ? 
-        (quoteResponse.routePlan ? quoteResponse : quoteResponse.data) : null;
-        
-      if (!routePlanData) {
-        spinner.fail('No routes found for this token!');
-        return { success: false, error: 'No routes found' };
+      // Jupiter API might return different response structures
+      // Extract the best route data from the response
+      let bestRoute = quoteResponse;
+      if (quoteResponse.data) {
+        bestRoute = quoteResponse.data;
+      }
+      
+      if (!bestRoute || !bestRoute.outAmount) {
+        spinner.fail('Invalid quote response from Jupiter');
+        return { success: false, error: 'Invalid quote response' };
       }
       
       if (verbose) console.log('Valid route found!');
-      
-      // Select best route (adjust this based on Jupiter API version)
-      const bestRoute = routePlanData;
       if (verbose) console.log('Selected best route with outAmount:', bestRoute.outAmount);
       
-      // Get swap instructions with improved error handling for v6 compatibility
+      // Get swap instructions with improved error handling
       if (verbose) console.log('Requesting swap transaction...');
       
-      // Try to determine if we're using v5 or v6 API
-      // This is a simplified approach - in production you'd want to check the actual API version
-      const isV6Api = !!quoteResponse.routePlan;
-      
-      let swapParams;
-      if (isV6Api) {
-        // V6 API format
-        swapParams = {
-          quoteResponse: bestRoute,
-          userPublicKey: keypair.publicKey.toString(),
-          wrapAndUnwrapSol: true // v6 might use this instead of wrapUnwrapSOL
-        };
-      } else {
-        // V5 API format
-        swapParams = {
-          quote: bestRoute,
-          userPublicKey: keypair.publicKey.toString(),
-          wrapUnwrapSOL: true
-        };
-      }
-      
-      if (verbose) console.log('Swap params:', JSON.stringify(swapParams, null, 2));
-      
+      // Use the correct format for Jupiter API
       let swapResponse;
       try {
-        // Try using v6 format first
-        if (isV6Api) {
-          swapResponse = await jupiterQuoteApi.swapPost({
+        if (verbose) console.log('Attempting Jupiter API - correct format');
+        
+        // This is the most likely format to work with current Jupiter API
+        swapResponse = await jupiterQuoteApi.swapPost({
+          swapRequest: {
             quoteResponse: bestRoute,
             userPublicKey: keypair.publicKey.toString(),
-            wrapAndUnwrapSol: true
+            wrapUnwrapSOL: true
+          }
+        }).catch(error => {
+          if (verbose) console.error('First format failed:', error);
+          return null;
+        });
+        
+        // If first attempt failed, try alternative formats
+        if (!swapResponse) {
+          if (verbose) console.log('Attempting Jupiter API - alternative format #1');
+          swapResponse = await jupiterQuoteApi.swapPost({
+            swapRequest: {
+              route: bestRoute,
+              userPublicKey: keypair.publicKey.toString(),
+              wrapUnwrapSOL: true
+            }
           }).catch(error => {
-            if (verbose) console.error('V6 swap request failed, will try V5 format:', error);
+            if (verbose) console.error('Alternative format #1 failed:', error);
             return null;
           });
         }
         
-        // If v6 didn't work or wasn't detected, try v5
+        // If still failed, try yet another format
         if (!swapResponse) {
+          if (verbose) console.log('Attempting Jupiter API - alternative format #2');
           swapResponse = await jupiterQuoteApi.swapPost({
-            swapRequest: swapParams
+            route: bestRoute,
+            userPublicKey: keypair.publicKey.toString(),
+            wrapUnwrapSOL: true
           }).catch(error => {
-            console.error('Error getting swap transaction:', error.response ? JSON.stringify(error.response.data) : error.message);
+            if (verbose) console.error('Alternative format #2 failed:', error);
             return null;
           });
         }
         
         if (verbose) console.log('Swap response received:', swapResponse ? 'yes' : 'no');
+        if (verbose && swapResponse) console.log('Swap response:', JSON.stringify(swapResponse, null, 2));
         
-        if (!swapResponse || (!swapResponse.swapTransaction && (!swapResponse.data || !swapResponse.data.swapTransaction))) {
-          spinner.fail('Failed to get swap transaction!');
+        if (!swapResponse) {
+          spinner.fail('Failed to get swap transaction after multiple attempts');
           return { success: false, error: 'Failed to get swap transaction' };
         }
       } catch (error) {
@@ -247,114 +338,201 @@ async function buyToken(tokenAddress, options = {}, pathConfig = {}) {
         return { success: false, error: `Swap transaction error: ${error.message}` };
       }
       
-      // Extract the swap transaction data
-      const swapTransactionData = swapResponse.swapTransaction || (swapResponse.data && swapResponse.data.swapTransaction);
+      // Extract the swap transaction data from the response
+      let swapTransactionData;
+      if (swapResponse.swapTransaction) {
+        swapTransactionData = swapResponse.swapTransaction;
+      } else if (swapResponse.data && swapResponse.data.swapTransaction) {
+        swapTransactionData = swapResponse.data.swapTransaction;
+      } else {
+        // Look deeper into the response to find the transaction
+        if (verbose) console.log('Searching deeper for transaction data in response');
+        if (swapResponse.data && typeof swapResponse.data === 'object') {
+          for (const key in swapResponse.data) {
+            if (typeof swapResponse.data[key] === 'string' && swapResponse.data[key].length > 100) {
+              if (verbose) console.log(`Found potential transaction data in field: ${key}`);
+              swapTransactionData = swapResponse.data[key];
+              break;
+            }
+          }
+        }
+      }
+      
       if (!swapTransactionData) {
         spinner.fail('No swap transaction data found in response');
         return { success: false, error: 'No swap transaction data' };
       }
       
-      // Create transaction
+      // Create transaction - FIX FOR VERSIONED TRANSACTIONS
       if (verbose) console.log('Creating transaction...');
       const swapTransactionBuf = Buffer.from(swapTransactionData, 'base64');
-      const transaction = Transaction.from(swapTransactionBuf);
-      if (verbose) console.log('Transaction created with', transaction.instructions.length, 'instructions');
       
-      // Add ComputeBudgetProgram for transaction with adjusted fee
-      if (computeLimit) {
-        // Add instruction to set compute unit limit
-        const computeBudgetIx = ComputeBudgetProgram.setComputeUnitLimit({
-          units: computeLimit
-        });
+      // CRITICAL FIX: Always assume it's a versioned transaction when coming from Jupiter
+      try {
+        if (verbose) console.log('Assuming versioned transaction format from Jupiter');
         
-        // Add priorityFee if using priorityFeeMultiplier > 1
-        if (config.priorityFeeMultiplier > 1) {
-          // Calculate microLamports based on computeLimit value
-          const priorityFeeMicroLamports = Math.floor((computeLimit / 10) * config.priorityFeeMultiplier);
-          const priorityFeeIx = ComputeBudgetProgram.setComputeUnitPrice({
-            microLamports: priorityFeeMicroLamports
-          });
-          
-          // Add instruction to the beginning of transaction
-          transaction.instructions.unshift(priorityFeeIx);
-          if (verbose) console.log('Added priority fee instruction:', priorityFeeMicroLamports, 'microLamports');
-          spinner.text = `Processing with priority fee: ${priorityFeeMicroLamports} microLamports...`;
+        // Use VersionedTransaction.deserialize to parse the transaction
+        const transaction = VersionedTransaction.deserialize(swapTransactionBuf);
+        
+        if (verbose) console.log('Successfully deserialized as versioned transaction with', 
+                                transaction.message.compiledInstructions.length, 'instructions');
+        
+        if (verbose) {
+          console.log('Transaction uses default compute budget from Jupiter');
         }
         
-        // Add compute limit instruction to the beginning of transaction
-        transaction.instructions.unshift(computeBudgetIx);
-        if (verbose) console.log('Added compute limit instruction:', computeLimit, 'units');
+        // Set transaction options
+        const txOptions = config.antiMEV ? {
+          skipPreflight: true,
+          preflightCommitment: 'processed',
+          maxRetries: 3
+        } : {
+          preflightCommitment: 'confirmed',
+          maxRetries: 3
+        };
+        if (verbose) console.log('Transaction options:', txOptions);
+        
+        // Sign and send the versioned transaction
+        if (verbose) console.log('Signing and sending versioned transaction...');
+        
+        // Sign the transaction with keypair
+        transaction.sign([keypair]);
+        
+        const txid = await connection.sendTransaction(transaction, txOptions);
+        if (verbose) console.log('Transaction sent with ID:', txid);
+        
+        // Wait for confirmation using our safer verification method
+        spinner.text = 'Waiting for transaction confirmation...';
+        
+        const verificationResult = await verifyTransactionOnChain(connection, txid, 40, verbose);
+        
+        if (verificationResult.success) {
+          spinner.succeed(`Successfully bought tokens! Transaction finalized on chain.`);
+          
+          // Get token amount purchased (token balance change)
+          let outputAmount = parseFloat(bestRoute.outAmount) / Math.pow(10, bestRoute.outputDecimals || 9);
+          
+          console.log(`Purchased approximately ${outputAmount.toLocaleString()} tokens for ${amount} SOL`);
+          console.log(`Transaction ID: ${txid}`);
+          
+          return {
+            success: true,
+            txid: txid,
+            amount: outputAmount,
+            amountSol: amount,
+            token: tokenAddress,
+            status: verificationResult.status
+          };
+        } else {
+          spinner.fail(`Transaction failed: ${verificationResult.error}`);
+          return { 
+            success: false, 
+            error: verificationResult.error, 
+            txid: txid,
+            status: verificationResult.status
+          };
+        }
+      } catch (error) {
+        // If versioned transaction deserialization fails, try legacy format as fallback
+        if (verbose) {
+          console.error('Versioned transaction deserialization failed:', error);
+          console.log('Falling back to legacy transaction format...');
+        }
+        
+        try {
+          // Try legacy transaction format as a last resort
+          const transaction = Transaction.from(swapTransactionBuf);
+          if (verbose) console.log('Created legacy transaction with', transaction.instructions.length, 'instructions');
+          
+          // Add ComputeBudgetProgram for transaction with adjusted fee
+          if (computeLimit) {
+            // Add instruction to set compute unit limit
+            const computeBudgetIx = ComputeBudgetProgram.setComputeUnitLimit({
+              units: computeLimit
+            });
+            
+            // Add priorityFee if using priorityFeeMultiplier > 1
+            if (config.priorityFeeMultiplier > 1) {
+              // Calculate microLamports based on computeLimit value
+              const priorityFeeMicroLamports = Math.floor((computeLimit / 10) * config.priorityFeeMultiplier);
+              const priorityFeeIx = ComputeBudgetProgram.setComputeUnitPrice({
+                microLamports: priorityFeeMicroLamports
+              });
+              
+              // Add instruction to the beginning of transaction
+              transaction.instructions.unshift(priorityFeeIx);
+              if (verbose) console.log('Added priority fee instruction:', priorityFeeMicroLamports, 'microLamports');
+              spinner.text = `Processing with priority fee: ${priorityFeeMicroLamports} microLamports...`;
+            }
+            
+            // Add compute limit instruction to the beginning of transaction
+            transaction.instructions.unshift(computeBudgetIx);
+            if (verbose) console.log('Added compute limit instruction:', computeLimit, 'units');
+          }
+          
+          // Set transaction options
+          const txOptions = config.antiMEV ? {
+            skipPreflight: true,
+            preflightCommitment: 'processed',
+            maxRetries: 3
+          } : {
+            preflightCommitment: 'confirmed',
+            maxRetries: 3
+          };
+          
+          // Send transaction
+          const txid = await sendAndConfirmTransaction(
+            connection,
+            transaction,
+            [keypair],
+            txOptions
+          );
+          
+          if (verbose) console.log('Legacy transaction sent with ID:', txid);
+          
+          // Verify that the transaction is on chain and finalized
+          spinner.text = 'Verifying transaction on chain...';
+          
+          const verificationResult = await verifyTransactionOnChain(connection, txid, 40, verbose);
+          
+          if (verificationResult.success) {
+            spinner.succeed(`Successfully bought tokens! Transaction finalized on chain.`);
+            
+            // Get token amount purchased (token balance change)
+            let outputAmount = parseFloat(bestRoute.outAmount) / Math.pow(10, bestRoute.outputDecimals || 9);
+            
+            console.log(`Purchased approximately ${outputAmount.toLocaleString()} tokens for ${amount} SOL`);
+            console.log(`Transaction ID: ${txid}`);
+            
+            if (config.priorityFeeMultiplier > 1) {
+              console.log(`Priority Fee: ${Math.floor((computeLimit / 10) * config.priorityFeeMultiplier)} microLamports`);
+            }
+            console.log(`Compute Units: ${computeLimit}`);
+            
+            return {
+              success: true,
+              txid: txid,
+              amount: outputAmount,
+              amountSol: amount,
+              token: tokenAddress,
+              status: verificationResult.status
+            };
+          } else {
+            spinner.fail(`Transaction failed: ${verificationResult.error}`);
+            return { 
+              success: false, 
+              error: verificationResult.error, 
+              txid: txid,
+              status: verificationResult.status
+            };
+          }
+        } catch (legacyError) {
+          // Both versioned and legacy deserialization failed
+          console.error('Legacy transaction deserialization also failed:', legacyError);
+          spinner.fail(`Transaction deserialization failed: ${error.message}`);
+          return { success: false, error: `Transaction deserialization failed: ${error.message}` };
+        }
       }
-      
-      // Set transaction options
-      const txOptions = config.antiMEV ? {
-        skipPreflight: true,
-        preflightCommitment: 'processed',
-        maxRetries: 3
-      } : {
-        preflightCommitment: 'confirmed',
-        maxRetries: 3
-      };
-      if (verbose) console.log('Transaction options:', txOptions);
-      
-      // Send and confirm transaction
-      if (verbose) console.log('Signing and sending transaction...');
-      const result = await sendAndConfirmTransaction(
-        connection,
-        transaction,
-        [keypair],
-        txOptions
-      );
-      if (verbose) console.log('Transaction confirmed with signature:', result);
-      
-      // Update holdings
-      const holdings = loadHoldings(HOLDINGS_FILE);
-      
-      // Get token details
-      const tokenInfo = {
-        address: tokenAddress,
-        buyPrice: parseFloat(bestRoute.outAmount) / parseFloat(bestRoute.inAmount),
-        amount: parseFloat(bestRoute.outAmount),
-        buyTime: Date.now(),
-        buyAmountSol: amount,
-        computeUnits: computeLimit,
-        priorityFee: config.priorityFeeMultiplier > 1 ? `${Math.floor((computeLimit / 10) * config.priorityFeeMultiplier)} microLamports` : 'None'
-      };
-      
-      // Add to holdings
-      holdings.tokens[tokenAddress] = tokenInfo;
-      
-      // Add to transactions
-      holdings.transactions.push({
-        type: 'buy',
-        token: tokenAddress,
-        amount: amount,
-        price: tokenInfo.buyPrice,
-        time: Date.now(),
-        txid: result,
-        computeUnits: computeLimit,
-        priorityFee: config.priorityFeeMultiplier > 1 ? `${Math.floor((computeLimit / 10) * config.priorityFeeMultiplier)} microLamports` : 'None'
-      });
-      
-      // Save holdings
-      saveHoldings(holdings, HOLDINGS_FILE);
-      
-      spinner.succeed(`Successfully bought ${tokenInfo.amount} tokens for ${amount} SOL!`);
-      console.log(`Transaction ID: ${result}`);
-      
-      if (config.priorityFeeMultiplier > 1) {
-        console.log(`Priority Fee: ${Math.floor((computeLimit / 10) * config.priorityFeeMultiplier)} microLamports`);
-      }
-      console.log(`Compute Units: ${computeLimit}`);
-      
-      return {
-        success: true,
-        tokenInfo,
-        txid: result,
-        amount: tokenInfo.amount,
-        amountSol: amount
-      };
-      
     } catch (error) {
       console.error('Error in quote processing:', error);
       spinner.fail(`Quote processing error: ${error.message}`);
@@ -368,5 +546,6 @@ async function buyToken(tokenAddress, options = {}, pathConfig = {}) {
 }
 
 module.exports = {
-  buyToken
+  buyToken,
+  verifyTransactionOnChain
 };
