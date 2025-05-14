@@ -1,11 +1,12 @@
-// updatedBuyToken.js
+// buyToken.js - Fixed version with proper connection handling
 const { PublicKey, Keypair, Transaction, VersionedTransaction, sendAndConfirmTransaction, LAMPORTS_PER_SOL } = require('@solana/web3.js');
 const { ComputeBudgetProgram } = require('@solana/web3.js');
 const { createJupiterApiClient } = require('@jup-ag/api');
 const ora = require('ora');
 const fs = require('fs');
-const path = require('path');
-const { getConnection } = require('./connectionManager');
+
+// Import connection manager
+const { getConnection, verifyTransactionOnChain } = require('./connectionManager');
 
 // Load config
 function loadConfig(configPath = 'config.json') {
@@ -16,139 +17,6 @@ function loadConfig(configPath = 'config.json') {
     console.error(`Error loading config from ${configPath}:`, error.message);
     process.exit(1);
   }
-}
-
-// Helper function to verify transaction on-chain
-async function verifyTransactionOnChain(signature, maxRetries = 40, verbose = false) {
-  if (verbose) console.log(`Verifying transaction ${signature} on chain...`);
-  
-  const connection = getConnection();
-  
-  // First, wait for the transaction to be finalized
-  let retries = maxRetries;
-  let txSuccess = false;
-  let status = null;
-  
-  while (retries > 0) {
-    try {
-      const signatureStatuses = await connection.getSignatureStatuses([signature]);
-      status = signatureStatuses && signatureStatuses.value[0];
-      
-      if (status) {
-        if (status.err) {
-          if (verbose) console.log(`Transaction ${signature} failed with error:`, status.err);
-          return { 
-            success: false, 
-            error: status.err, 
-            status: 'failed' 
-          };
-        } else if (status.confirmationStatus === 'finalized') {
-          if (verbose) console.log(`Transaction ${signature} finalized on chain`);
-          txSuccess = true;
-          break;
-        } else if (status.confirmationStatus === 'confirmed') {
-          if (verbose) console.log(`Transaction ${signature} confirmed but waiting for finalization...`);
-        }
-      } else {
-        if (verbose && retries % 5 === 0) console.log(`Transaction not found yet. Retries left: ${retries}`);
-      }
-    } catch (e) {
-      if (verbose) console.log(`Error checking status: ${e.message}. Retrying...`);
-    }
-    
-    retries--;
-    await new Promise(resolve => setTimeout(resolve, 1000)); // Wait 1 second between retries
-  }
-  
-  if (!txSuccess) {
-    // Double-check by trying to get the transaction directly
-    try {
-      const tx = await connection.getTransaction(signature, { maxSupportedTransactionVersion: 0 });
-      if (tx && !tx.meta.err) {
-        if (verbose) console.log(`Transaction ${signature} found on chain through direct lookup`);
-        txSuccess = true;
-      } else if (tx && tx.meta.err) {
-        if (verbose) console.log(`Transaction ${signature} found on chain but has errors:`, tx.meta.err);
-        return { 
-          success: false, 
-          error: tx.meta.err, 
-          status: 'failed' 
-        };
-      }
-    } catch (e) {
-      if (verbose) console.log(`Error getting transaction: ${e.message}`);
-    }
-  }
-
-  // Now verify the token transfer by checking the post balances
-  if (txSuccess) {
-    try {
-      const tx = await connection.getTransaction(signature, { maxSupportedTransactionVersion: 0 });
-      
-      if (!tx) {
-        return { 
-          success: false, 
-          error: 'Transaction found but details could not be retrieved', 
-          status: 'verification_failed' 
-        };
-      }
-
-      // Check for errors in transaction metadata
-      if (tx.meta && tx.meta.err) {
-        if (verbose) console.log(`Transaction has errors in metadata:`, tx.meta.err);
-        return { 
-          success: false, 
-          error: tx.meta.err, 
-          status: 'failed' 
-        };
-      }
-      
-      // Verify that the transaction is actually finalized
-      // This is a final security check to avoid false positives
-      if (tx.confirmationStatus !== 'finalized') {
-        const retriesForFinalization = 10;
-        let finalized = false;
-        
-        for (let i = 0; i < retriesForFinalization; i++) {
-          const currentStatus = await connection.getSignatureStatus(signature);
-          if (currentStatus && currentStatus.value && currentStatus.value.confirmationStatus === 'finalized') {
-            finalized = true;
-            break;
-          }
-          await new Promise(resolve => setTimeout(resolve, 1000));
-        }
-        
-        if (!finalized) {
-          if (verbose) console.log(`Transaction exists but is not finalized after additional checks`);
-          return { 
-            success: false, 
-            error: 'Transaction not finalized', 
-            status: 'not_finalized' 
-          };
-        }
-      }
-      
-      // At this point, we're confident the transaction succeeded and is finalized
-      return { 
-        success: true, 
-        status: 'finalized',
-        transaction: tx
-      };
-    } catch (error) {
-      if (verbose) console.error(`Error during transaction verification:`, error);
-      return { 
-        success: false, 
-        error: `Verification error: ${error.message}`, 
-        status: 'verification_error' 
-      };
-    }
-  }
-  
-  return { 
-    success: false, 
-    error: 'Transaction not found on chain after maximum retries', 
-    status: 'not_found' 
-  };
 }
 
 // Buy token function
@@ -176,9 +44,10 @@ async function buyToken(keypair, tokenAddress, options = {}) {
     const amount = options.amount ? parseFloat(options.amount) : config.defaultBuyAmount;
     if (verbose) console.log('Buy amount (SOL):', amount);
     
-    // Get reusable connection instance
-    const connection = getConnection();
-    if (verbose) console.log('Using reusable connection');
+    // Get connection for quotes and setup (confirmed commitment)
+    // Use confirmed commitment for general setup and queries
+    const connection = getConnection(false, 'config.json', 'confirmed');
+    if (verbose) console.log('Using connection with confirmed commitment for setup');
     
     // Test RPC connection
     try {
@@ -370,6 +239,11 @@ async function buyToken(keypair, tokenAddress, options = {}) {
       if (verbose) console.log('Creating transaction...');
       const swapTransactionBuf = Buffer.from(swapTransactionData, 'base64');
       
+      // CRITICAL FIX: Use processed commitment for faster transaction confirmation
+      // Get a new connection with processed commitment for sending transaction
+      const txConnection = getConnection(false, 'config.json', 'processed');
+      if (verbose) console.log('Using connection with processed commitment for transaction submission');
+      
       // CRITICAL FIX: Always assume it's a versioned transaction when coming from Jupiter
       try {
         if (verbose) console.log('Assuming versioned transaction format from Jupiter');
@@ -388,10 +262,10 @@ async function buyToken(keypair, tokenAddress, options = {}) {
         const txOptions = config.antiMEV ? {
           skipPreflight: true,
           preflightCommitment: 'processed',
-          maxRetries: 3
+          maxRetries: 5  // Increased from 3 to 5
         } : {
-          preflightCommitment: 'confirmed',
-          maxRetries: 3
+          preflightCommitment: 'processed',  // Changed from 'confirmed' to 'processed'
+          maxRetries: 5   // Increased from 3 to 5
         };
         if (verbose) console.log('Transaction options:', txOptions);
         
@@ -401,13 +275,13 @@ async function buyToken(keypair, tokenAddress, options = {}) {
         // Sign the transaction with keypair
         transaction.sign([keypair]);
         
-        const txid = await connection.sendTransaction(transaction, txOptions);
+        const txid = await txConnection.sendTransaction(transaction, txOptions);
         if (verbose) console.log('Transaction sent with ID:', txid);
         
         // Wait for confirmation using our safer verification method
         spinner.text = 'Waiting for transaction confirmation...';
         
-        const verificationResult = await verifyTransactionOnChain(txid, 40, verbose);
+        const verificationResult = await verifyTransactionOnChain(txid, 60, verbose);  // Increased timeout to 60
         
         if (verificationResult.success) {
           spinner.succeed(`Successfully bought tokens! Transaction finalized on chain.`);
@@ -473,19 +347,19 @@ async function buyToken(keypair, tokenAddress, options = {}) {
             if (verbose) console.log('Added compute limit instruction:', computeLimit, 'units');
           }
           
-          // Set transaction options
+          // Set transaction options - IMPORTANT: Use processed commitment for sending
           const txOptions = config.antiMEV ? {
             skipPreflight: true,
             preflightCommitment: 'processed',
-            maxRetries: 3
+            maxRetries: 5
           } : {
-            preflightCommitment: 'confirmed',
-            maxRetries: 3
+            preflightCommitment: 'processed',
+            maxRetries: 5
           };
           
-          // Send transaction
+          // Send transaction with processed commitment connection
           const txid = await sendAndConfirmTransaction(
-            connection,
+            txConnection,
             transaction,
             [keypair],
             txOptions
@@ -496,7 +370,7 @@ async function buyToken(keypair, tokenAddress, options = {}) {
           // Verify that the transaction is on chain and finalized
           spinner.text = 'Verifying transaction on chain...';
           
-          const verificationResult = await verifyTransactionOnChain(txid, 40, verbose);
+          const verificationResult = await verifyTransactionOnChain(txid, 60, verbose);
           
           if (verificationResult.success) {
             spinner.succeed(`Successfully bought tokens! Transaction finalized on chain.`);
@@ -549,6 +423,5 @@ async function buyToken(keypair, tokenAddress, options = {}) {
 }
 
 module.exports = {
-  buyToken,
-  verifyTransactionOnChain
+  buyToken
 };
