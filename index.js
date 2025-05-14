@@ -1,4 +1,15 @@
-// Load config
+#!/usr/bin/env node
+// index.js - Updated with status command
+const { program } = require('commander');
+const { PublicKey } = require('@solana/web3.js');
+const { buyToken } = require('./buyToken');
+const { sellToken } = require('./sellToken');
+const { createWallet, importWallet, loadWallet } = require('./wallet');
+const { getConnection, testConnection, resetConnections } = require('./connectionManager');
+const fs = require('fs');
+const ora = require('ora');
+
+// Function to load config - duplicated to avoid circular dependencies
 function loadConfig(configPath = 'config.json') {
   try {
     const configData = fs.readFileSync(configPath, 'utf8');
@@ -7,13 +18,7 @@ function loadConfig(configPath = 'config.json') {
     console.error(`Error loading config from ${configPath}:`, error.message);
     process.exit(1);
   }
-}// index.js
-const { program } = require('commander');
-const { Connection, PublicKey } = require('@solana/web3.js');
-const { buyToken } = require('./buyToken');
-const { sellToken } = require('./sellToken');
-const { createWallet, importWallet, loadWallet } = require('./wallet');
-const fs = require('fs');
+}
 
 // Main program
 async function main() {
@@ -21,6 +26,17 @@ async function main() {
     .name('solana-meme-trader')
     .description('A Solana meme token trading bot')
     .version('1.0.0');
+
+  // Initialize the shared connection at startup
+  try {
+    const config = loadConfig();
+    // This will create the singleton connection that will be reused
+    const connection = getConnection(true, 'config.json', 'confirmed');
+    await testConnection(false); // Just test it silently
+  } catch (error) {
+    console.error('Failed to initialize connection:', error.message);
+    // Continue anyway, individual commands will retry
+  }
 
   // Wallet commands
   program
@@ -123,12 +139,10 @@ async function main() {
         
         // If tokenAddress is not provided, show a simpler interactive menu
         if (!tokenAddress) {
-          // Load config to get RPC URL
-          const config = loadConfig();
-          const connection = new Connection(config.rpcUrl, 'confirmed');
+          // Get the reusable connection from the connection manager
+          const connection = getConnection();
           
           // Start spinner to indicate loading
-          const ora = require('ora');
           const spinner = ora('Fetching token holdings...').start();
           
           try {
@@ -218,6 +232,129 @@ async function main() {
       }
     });
 
+  // Add a new command to check connection status
+  program
+    .command('status')
+    .description('Check connection status and RPC endpoint')
+    .action(async () => {
+      try {
+        const config = loadConfig();
+        console.log(`Current RPC URL: ${config.rpcUrl}`);
+        
+        const spinner = ora('Testing connection to RPC endpoint...').start();
+        
+        // Force refresh the connection to ensure we're testing the current URL
+        const connection = getConnection(true);
+        
+        try {
+          // Test basic connection
+          const version = await connection.getVersion();
+          spinner.succeed('Connection successful!');
+          console.log(`Solana version: ${JSON.stringify(version)}`);
+          
+          // Test additional metrics
+          spinner.text = 'Checking current slot...';
+          spinner.start();
+          const slot = await connection.getSlot();
+          spinner.succeed(`Current slot: ${slot}`);
+          
+          // Calculate latency
+          spinner.text = 'Measuring RPC latency...';
+          spinner.start();
+          const startTime = Date.now();
+          await connection.getRecentBlockhash();
+          const endTime = Date.now();
+          const latency = endTime - startTime;
+          
+          if (latency < 500) {
+            spinner.succeed(`RPC Latency: ${latency}ms (Good)`);
+          } else if (latency < 1000) {
+            spinner.succeed(`RPC Latency: ${latency}ms (Acceptable)`);
+          } else {
+            spinner.warn(`RPC Latency: ${latency}ms (High - Consider upgrading RPC)`);
+          }
+          
+          // Test getting block time
+          try {
+            spinner.text = 'Checking block time...';
+            spinner.start();
+            const blockTime = await connection.getBlockTime(slot);
+            if (blockTime) {
+              const date = new Date(blockTime * 1000);
+              spinner.succeed(`Current block time: ${date.toISOString()}`);
+              
+              // Check if block time is recent
+              const now = Date.now() / 1000;
+              const timeDiff = now - blockTime;
+              if (timeDiff > 60) {
+                spinner.warn(`Block time is ${Math.floor(timeDiff)}s behind current time - RPC might be slow to sync`);
+              }
+            }
+          } catch (error) {
+            spinner.fail(`Error getting block time: ${error.message}`);
+          }
+          
+          // Test getting a few accounts to check account loading
+          try {
+            spinner.text = 'Testing account loading...';
+            spinner.start();
+            const startTimeAccounts = Date.now();
+            await connection.getParsedProgramAccounts(
+              new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'),
+              { limit: 1 }
+            );
+            const endTimeAccounts = Date.now();
+            const accountLatency = endTimeAccounts - startTimeAccounts;
+            
+            if (accountLatency < 1000) {
+              spinner.succeed(`Account loading latency: ${accountLatency}ms (Good)`);
+            } else if (accountLatency < 2000) {
+              spinner.succeed(`Account loading latency: ${accountLatency}ms (Acceptable)`);
+            } else {
+              spinner.warn(`Account loading latency: ${accountLatency}ms (High - Consider upgrading RPC)`);
+            }
+          } catch (error) {
+            spinner.fail(`Error testing account loading: ${error.message}`);
+          }
+          
+          // Summary
+          console.log('\nRPC Health Summary:');
+          if (latency < 800 && accountLatency < 1500) {
+            console.log('✅ RPC appears to be healthy and performing well');
+          } else {
+            console.log('⚠️ RPC performance could be improved - consider upgrading to a dedicated RPC provider');
+            console.log('   Recommended providers:');
+            console.log('   - QuickNode: https://www.quicknode.com/chains/sol');
+            console.log('   - Helius: https://www.helius.dev/');
+            console.log('   - Triton: https://triton.one/');
+          }
+        } catch (error) {
+          spinner.fail(`Connection test failed: ${error.message}`);
+          console.log('Consider checking or updating your RPC URL in config.json');
+          console.log('Recommended RPC providers:');
+          console.log('- QuickNode: https://www.quicknode.com/chains/sol');
+          console.log('- Helius: https://www.helius.dev/');
+          console.log('- Triton: https://triton.one/');
+        }
+      } catch (error) {
+        console.error('Error checking connection status:', error.message);
+      }
+    });
+
+  // Add a command to reset connections
+  program
+    .command('reset')
+    .description('Reset all connection instances')
+    .action(() => {
+      try {
+        resetConnections();
+        console.log('All connections have been reset');
+        console.log('Try checking status with: node index.js status');
+      } catch (error) {
+        console.error('Error resetting connections:', error.message);
+      }
+    });
+
   // Setup config
   program
     .command('init')
@@ -257,6 +394,9 @@ async function main() {
         fs.writeFileSync(options.path, JSON.stringify(defaultConfig, null, 2));
         console.log(`Config file created at ${options.path}`);
         console.log('You may want to customize the RPC URL and other settings.');
+        
+        // Initialize connection with the new config
+        const connection = getConnection(true);
       } catch (error) {
         console.error('Error creating config file:', error.message);
       }
