@@ -1,11 +1,12 @@
-// updatedSellToken.js
+// sellToken.js - Fixed version with proper connection handling
 const { PublicKey, Transaction, VersionedTransaction, sendAndConfirmTransaction, LAMPORTS_PER_SOL } = require('@solana/web3.js');
 const { ComputeBudgetProgram } = require('@solana/web3.js');
 const { createJupiterApiClient } = require('@jup-ag/api');
 const ora = require('ora');
 const fs = require('fs');
-const path = require('path');
-const { getConnection } = require('./connectionManager');
+
+// Import connection manager
+const { getConnection, verifyTransactionOnChain } = require('./connectionManager');
 
 // Load config
 function loadConfig(configPath = 'config.json') {
@@ -17,8 +18,6 @@ function loadConfig(configPath = 'config.json') {
     process.exit(1);
   }
 }
-
-// Helper function to verify transaction on-chain moved to connectionManager
 
 // Sell token function
 async function sellToken(keypair, tokenAddress, options = {}) {
@@ -44,9 +43,9 @@ async function sellToken(keypair, tokenAddress, options = {}) {
     let sellPercentage = options.percentage ? parseFloat(options.percentage) : 100;
     if (options.all) sellPercentage = 100;
     
-    // Get reusable connection instance
-    const connection = getConnection();
-    if (verbose) console.log('Using reusable connection');
+    // Get connection for account queries with confirmed commitment
+    const connection = getConnection(false, 'config.json', 'confirmed');
+    if (verbose) console.log('Using connection with confirmed commitment for queries');
     
     try {
       if (verbose) console.log('Checking RPC connection...');
@@ -286,6 +285,10 @@ async function sellToken(keypair, tokenAddress, options = {}) {
       if (verbose) console.log('Creating transaction...');
       const swapTransactionBuf = Buffer.from(swapTransactionData, 'base64');
       
+      // Get a specialized connection for transaction sending with processed commitment
+      const txConnection = getConnection(false, 'config.json', 'processed');
+      if (verbose) console.log('Using connection with processed commitment for transaction submission');
+      
       // FIRST TRY: Attempt as a versioned transaction
       try {
         if (verbose) console.log('Attempting versioned transaction format from Jupiter');
@@ -296,14 +299,14 @@ async function sellToken(keypair, tokenAddress, options = {}) {
         if (verbose) console.log('Successfully deserialized as versioned transaction with',
                                transaction.message.compiledInstructions.length, 'instructions');
         
-        // Set transaction options
+        // Set transaction options - CRITICAL: Use processed commitment for sending
         const txOptions = config.antiMEV ? {
           skipPreflight: true,
           preflightCommitment: 'processed',
-          maxRetries: 3
+          maxRetries: 5  // Increased from 3 to 5
         } : {
-          preflightCommitment: 'confirmed',
-          maxRetries: 3
+          preflightCommitment: 'processed',  // Changed from 'confirmed' to 'processed'
+          maxRetries: 5   // Increased from 3 to 5
         };
         if (verbose) console.log('Transaction options:', txOptions);
         
@@ -313,15 +316,13 @@ async function sellToken(keypair, tokenAddress, options = {}) {
         // Sign the transaction with keypair
         transaction.sign([keypair]);
         
-        const txid = await connection.sendTransaction(transaction, txOptions);
+        const txid = await txConnection.sendTransaction(transaction, txOptions);
         if (verbose) console.log('Transaction sent with ID:', txid);
         
         // Wait for confirmation using our verification method
         spinner.text = 'Waiting for transaction confirmation...';
         
-        // Get verifyTransactionOnChain from connection manager
-        const { verifyTransactionOnChain } = require('./connectionManager');
-        const verificationResult = await verifyTransactionOnChain(txid, 40, verbose);
+        const verificationResult = await verifyTransactionOnChain(txid, 60, verbose);  // Increased timeout from 40 to 60
         
         if (verificationResult.success) {
           // Calculate sold amount in SOL 
@@ -387,19 +388,19 @@ async function sellToken(keypair, tokenAddress, options = {}) {
             if (verbose) console.log('Added compute limit instruction:', computeLimit, 'units');
           }
           
-          // Set transaction options
+          // Set transaction options - CRITICAL: Use processed commitment for sending
           const txOptions = config.antiMEV ? {
             skipPreflight: true,
             preflightCommitment: 'processed',
-            maxRetries: 3
+            maxRetries: 5
           } : {
-            preflightCommitment: 'confirmed',
-            maxRetries: 3
+            preflightCommitment: 'processed',
+            maxRetries: 5
           };
           
-          // Send and confirm legacy transaction
+          // Send and confirm legacy transaction using the processed commitment connection
           const txid = await sendAndConfirmTransaction(
-            connection,
+            txConnection,
             transaction,
             [keypair],
             txOptions
@@ -410,8 +411,7 @@ async function sellToken(keypair, tokenAddress, options = {}) {
           // Verify that the transaction is on chain and finalized
           spinner.text = 'Verifying transaction on chain...';
           
-          const { verifyTransactionOnChain } = require('./connectionManager');
-          const verificationResult = await verifyTransactionOnChain(txid, 40, verbose);
+          const verificationResult = await verifyTransactionOnChain(txid, 60, verbose);
           
           // Calculate priorityFee used
           const priorityFeeMicroLamports = config.priorityFeeMultiplier > 1 ? 
